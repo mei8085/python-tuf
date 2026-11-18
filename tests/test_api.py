@@ -470,6 +470,105 @@ class TestMetadata(unittest.TestCase):
             Snapshot.type, snapshot_md.signed_bytes, snapshot_md.signatures
         )
 
+    def test_verify_delegate_counts_distinct_keys(self) -> None:
+        root_path = os.path.join(self.repo_dir, "metadata", "root.json")
+        root = Metadata[Root].from_file(root_path).signed
+        snapshot_path = os.path.join(self.repo_dir, "metadata", "snapshot.json")
+        snapshot_md = Metadata[Snapshot].from_file(snapshot_path)
+        payload = snapshot_md.signed_bytes
+
+        snapshot_role = root.roles[Snapshot.type]
+        keyid = snapshot_role.keyids[0]
+        key = root.keys[keyid]
+        sig = snapshot_md.signatures[keyid]
+
+        # Repeating the same keyid in the delegation only counts once:
+        # one public key cannot meet a threshold of 2
+        snapshot_role.threshold = 2
+        snapshot_role.keyids = [keyid, keyid]
+        with self.assertRaises(exceptions.UnsignedMetadataError):
+            root.verify_delegate(Snapshot.type, payload, snapshot_md.signatures)
+
+        # The same key listed under a second keyid (with a copy of the
+        # same valid signature) still only counts once
+        dup_keyid = "f" * 64
+        root.keys[dup_keyid] = SSlibKey(
+            dup_keyid, key.keytype, key.scheme, dict(key.keyval)
+        )
+        snapshot_role.keyids = [keyid, dup_keyid]
+        dup_sigs = dict(snapshot_md.signatures)
+        dup_sigs[dup_keyid] = Signature(dup_keyid, sig.signature)
+        with self.assertRaises(exceptions.UnsignedMetadataError):
+            root.verify_delegate(Snapshot.type, payload, dup_sigs)
+
+        # The same key material in a different encoding (upper-case hex
+        # public value) is still the same key and only counts once
+        enc_keyid = "e" * 64
+        root.keys[enc_keyid] = SSlibKey(
+            enc_keyid,
+            key.keytype,
+            key.scheme,
+            {"public": key.keyval["public"].upper()},
+        )
+        snapshot_role.keyids = [keyid, enc_keyid]
+        enc_sigs = dict(snapshot_md.signatures)
+        enc_sigs[enc_keyid] = Signature(enc_keyid, sig.signature)
+        with self.assertRaises(exceptions.UnsignedMetadataError):
+            root.verify_delegate(Snapshot.type, payload, enc_sigs)
+
+        # Signatures from keyids that are not delegated to the role are
+        # ignored: they neither break a met threshold nor help reach one
+        snapshot_role.keyids = [keyid]
+        unknown_sigs = dict(snapshot_md.signatures)
+        unknown_sigs["0" * 64] = Signature("0" * 64, "ab" * 64)
+        snapshot_role.threshold = 1
+        root.verify_delegate(Snapshot.type, payload, unknown_sigs)
+        snapshot_role.threshold = 2
+        with self.assertRaises(exceptions.UnsignedMetadataError):
+            root.verify_delegate(Snapshot.type, payload, unknown_sigs)
+
+    def test_verify_delegate_is_deterministic_and_stateless(self) -> None:
+        root_path = os.path.join(self.repo_dir, "metadata", "root.json")
+        root = Metadata[Root].from_file(root_path).signed
+        snapshot_path = os.path.join(self.repo_dir, "metadata", "snapshot.json")
+        snapshot_md = Metadata[Snapshot].from_file(snapshot_path)
+        payload = snapshot_md.signed_bytes
+
+        snapshot_role = root.roles[Snapshot.type]
+        keyid = snapshot_role.keyids[0]
+        sig = snapshot_md.signatures[keyid]
+        ts_keyid = root.roles[Timestamp.type].keyids[0]
+
+        # Two distinct delegated keys meet a threshold of 2, and the
+        # result does not depend on the order of the signatures
+        snapshot_role.threshold = 2
+        snapshot_role.keyids = [keyid, ts_keyid]
+        ts_sig = self.signers[Timestamp.type].sign(payload)
+        sigs = {keyid: sig, ts_keyid: ts_sig}
+        reversed_sigs = dict(reversed(list(sigs.items())))
+        for ordered_sigs in (sigs, reversed_sigs):
+            result = root.get_verification_result(
+                Snapshot.type, payload, ordered_sigs
+            )
+            self.assertTrue(result.verified)
+            self.assertEqual(set(result.signed), {keyid, ts_keyid})
+            self.assertEqual(result.unsigned, {})
+        root.verify_delegate(Snapshot.type, payload, sigs)
+
+        # A failed verification leaves no partial counts behind: the same
+        # call fails again (nothing accumulates), and a later call only
+        # counts the signatures it is given
+        only_one_sig = {keyid: sig}
+        for _ in range(2):
+            result = root.get_verification_result(
+                Snapshot.type, payload, only_one_sig
+            )
+            self.assertFalse(result.verified)
+            self.assertEqual(set(result.signed), {keyid})
+            self.assertEqual(set(result.unsigned), {ts_keyid})
+            with self.assertRaises(exceptions.UnsignedMetadataError):
+                root.verify_delegate(Snapshot.type, payload, only_one_sig)
+
     def test_verification_result(self) -> None:
         key = SSlibKey("", "", "", {"public": ""})
         vr = VerificationResult(3, {"a": key}, {"b": key})

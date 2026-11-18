@@ -11,6 +11,7 @@ import fnmatch
 import hashlib
 import io
 import logging
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import (
@@ -69,6 +70,27 @@ def _hash_file(f: IO[bytes], algo: str) -> str:
     f.seek(0)
     digest = hashlib.file_digest(f, lambda: _get_digest(algo))  # type: ignore[arg-type]
     return digest.hexdigest()
+
+
+def _canonical_key_identity(key: Key) -> tuple[str, str]:
+    """Return a canonical identity for the public key material of ``key``.
+
+    The identity deliberately excludes the keyid and the scheme: the same
+    public key may be listed under multiple keyids (for example keyids
+    computed with different hash algorithms) or under different encodings
+    of the same key material (for example different PEM whitespace or
+    different hex case). All of those forms map to a single identity, so
+    that one key can only count once towards a signature threshold.
+    """
+    # Remove all whitespace: PEM formatting (line endings, wrapping) and
+    # insignificant spaces in hex strings do not change the key material.
+    public = "".join(key.keyval["public"].split())
+    with suppress(ValueError):
+        # Normalize hex-encoded public keys (e.g. ed25519) to lower case.
+        # Non-hex values (e.g. PEM) keep the whitespace-normalized form.
+        public = bytes.fromhex(public).hex()
+
+    return key.keytype, public
 
 
 class Signed(metaclass=abc.ABCMeta):
@@ -330,9 +352,11 @@ class VerificationResult:
     """Signature verification result for delegated role metadata.
 
     Attributes:
-        threshold: Number of required signatures.
-        signed: dict of keyid to Key, containing keys that have signed.
-        unsigned: dict of keyid to Key, containing keys that have not signed.
+        threshold: Number of required signatures from distinct keys.
+        signed: dict of keyid to Key, containing one entry per distinct
+            key that has a valid signature.
+        unsigned: dict of keyid to Key, containing one entry per distinct
+            key that does not have a valid signature.
     """
 
     threshold: int
@@ -425,6 +449,17 @@ class _DelegatorMixin(metaclass=abc.ABCMeta):
     ) -> VerificationResult:
         """Return signature threshold verification result for delegated role.
 
+        The threshold counts distinct public keys, not signatures: a key
+        that is delegated under multiple keyids (or under different
+        encodings of the same key material) only counts once, no matter
+        how many valid signatures exist for it. Signatures from keyids
+        that are not delegated to the role are ignored, and the result
+        does not depend on the order of ``signatures``.
+
+        The method is stateless: every call starts from a clean slate and
+        a failed verification leaves no partial counts behind for the
+        next call.
+
         NOTE: Unlike `verify_delegate()` this method does not raise, if the
         role metadata is not fully verified.
 
@@ -438,9 +473,11 @@ class _DelegatorMixin(metaclass=abc.ABCMeta):
         """
         role = self.get_delegated_role(delegated_role)
 
-        signed = {}
-        unsigned = {}
-
+        # Group delegated keyids by the canonical identity of the key they
+        # resolve to, so each distinct public key is only counted once.
+        # Iteration follows role.keyids order, making the result
+        # deterministic and independent of signature order.
+        key_groups: dict[tuple[str, str], list[tuple[str, Key]]] = {}
         for keyid in role.keyids:
             try:
                 key = self.get_key(keyid)
@@ -448,18 +485,36 @@ class _DelegatorMixin(metaclass=abc.ABCMeta):
                 logger.info("No key for keyid %s", keyid)
                 continue
 
-            if keyid not in signatures:
-                unsigned[keyid] = key
-                logger.info("No signature for keyid %s", keyid)
-                continue
+            identity = _canonical_key_identity(key)
+            if identity in key_groups:
+                logger.info(
+                    "Duplicate key for keyid %s: counting only once", keyid
+                )
+            key_groups.setdefault(identity, []).append((keyid, key))
 
-            sig = signatures[keyid]
-            try:
-                key.verify_signature(sig, payload)
-                signed[keyid] = key
-            except sslib_exceptions.UnverifiedSignatureError:
+        signed = {}
+        unsigned = {}
+
+        for group in key_groups.values():
+            # A distinct key counts as signed if any of its keyids has a
+            # valid signature over the payload.
+            for keyid, key in group:
+                sig = signatures.get(keyid)
+                if sig is None:
+                    logger.info("No signature for keyid %s", keyid)
+                    continue
+
+                try:
+                    key.verify_signature(sig, payload)
+                    signed[keyid] = key
+                    break
+                except sslib_exceptions.UnverifiedSignatureError:
+                    logger.info(
+                        "Key %s failed to verify %s", keyid, delegated_role
+                    )
+            else:
+                keyid, key = group[0]
                 unsigned[keyid] = key
-                logger.info("Key %s failed to verify %s", keyid, delegated_role)
 
         return VerificationResult(role.threshold, signed, unsigned)
 
@@ -471,9 +526,10 @@ class _DelegatorMixin(metaclass=abc.ABCMeta):
     ) -> None:
         """Verify signature threshold for delegated role.
 
-        Verify that there are enough valid ``signatures`` over ``payload``, to
-        meet the threshold of keys for ``delegated_role``, as defined by the
-        delegator (``self``).
+        Verify that there are enough valid ``signatures`` over ``payload``
+        from distinct public keys, to meet the threshold of keys for
+        ``delegated_role``, as defined by the delegator (``self``). See
+        ``get_verification_result()`` for the exact counting rules.
 
         Args:
             delegated_role: Name of the delegated role to verify
