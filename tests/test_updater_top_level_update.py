@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import builtins
+import hashlib
 import os
 import sys
 import tempfile
@@ -26,6 +27,7 @@ from tuf.api.exceptions import (
     ExpiredMetadataError,
     LengthOrHashMismatchError,
     UnsignedMetadataError,
+    UnsupportedHashAlgorithmError,
 )
 from tuf.api.metadata import (
     SPECIFICATION_VERSION,
@@ -575,6 +577,24 @@ class TestRefresh(unittest.TestCase):
 
         self._assert_version_equals(Snapshot.type, 3)
         self._assert_version_equals(Targets.type, 1)
+
+    def test_metadata_weak_hash_algorithm_rejected(self) -> None:
+        """Timestamp with a weak snapshot hash is rejected explicitly.
+
+        The digest is correct (md5 of the actual snapshot bytes), so the only
+        reason to fail is the algorithm itself. This keeps metadata and target
+        verification on the same policy: neither path accepts a weak
+        algorithm.
+        """
+        # Publish timestamp v2 with a correct md5 hash of snapshot bytes
+        snapshot_bytes = self.sim.fetch_metadata(Snapshot.type)
+        self.sim.timestamp.snapshot_meta.hashes = {
+            "md5": hashlib.md5(snapshot_bytes).hexdigest()
+        }
+        self.sim.timestamp.version += 1
+
+        with self.assertRaises(UnsupportedHashAlgorithmError):
+            self._run_refresh()
 
     def test_new_targets_unsigned(self) -> None:
         # Check for an arbitrary software attack

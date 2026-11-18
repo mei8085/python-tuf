@@ -234,11 +234,18 @@ class Updater:
 
         Raises:
             ValueError: Incorrect arguments
+            UnsupportedHashAlgorithmError: ``targetinfo`` contains a hash
+                algorithm that is not supported or not allowed. This is raised
+                even when the local file would have matched.
 
         Returns:
             Local file path if the file is an up to date target file.
             ``None`` if file is not found or it is not up to date.
         """
+
+        # Reject unsupported hash algorithms explicitly instead of reporting
+        # "not cached": the cached file cannot be verified with this metadata.
+        targetinfo.validate_hash_algorithms()
 
         if filepath is None:
             filepath = self._generate_target_file_path(targetinfo)
@@ -272,10 +279,17 @@ class Updater:
             DownloadError: Download of the target file failed in some way
             RepositoryError: Downloaded target failed to be verified in some way
             OSError: Failed to write target to file
+            UnsupportedHashAlgorithmError: ``targetinfo`` contains a hash
+                algorithm that is not supported or not allowed. This is raised
+                before any target content is downloaded.
 
         Returns:
             Local path to downloaded file
         """
+
+        # Reject unusable metadata before downloading: the error must be
+        # explicit and must not depend on what the repository serves.
+        targetinfo.validate_hash_algorithms()
 
         if filepath is None:
             filepath = self._generate_target_file_path(targetinfo)

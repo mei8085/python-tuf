@@ -24,7 +24,11 @@ from typing import (
 from securesystemslib import exceptions as sslib_exceptions
 from securesystemslib.signer import Key, Signature
 
-from tuf.api.exceptions import LengthOrHashMismatchError, UnsignedMetadataError
+from tuf.api.exceptions import (
+    LengthOrHashMismatchError,
+    UnsignedMetadataError,
+    UnsupportedHashAlgorithmError,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -36,6 +40,34 @@ _TIMESTAMP = "timestamp"
 
 _DEFAULT_HASH_ALGORITHM = "sha256"
 _BLAKE_HASH_ALGORITHM = "blake2b-256"
+
+# Hash algorithms that may be used for verifying and generating file hashes.
+# The set contains the canonical names reported by hashlib (aliases such as
+# "SHA256" or "sha-256" are normalized before the check) and the legacy
+# python-tuf spelling for 256 bit blake2b.
+#
+# Weak algorithms (md5, sha1, ...) and unknown algorithms are rejected
+# outright: if a hash dictionary contains even one algorithm that is not
+# allowed, the whole dictionary is rejected. This way a weak algorithm can
+# never be used as a fallback, and the rejection happens before any file
+# content is hashed.
+_ALLOWED_HASH_ALGORITHMS = frozenset(
+    {
+        "sha224",
+        "sha256",
+        "sha384",
+        "sha512",
+        "sha512_224",
+        "sha512_256",
+        "sha3_224",
+        "sha3_256",
+        "sha3_384",
+        "sha3_512",
+        "blake2s",
+        "blake2b",
+        _BLAKE_HASH_ALGORITHM,
+    }
+)
 
 # We aim to support SPECIFICATION_VERSION and require the input metadata
 # files to have the same major version (the first number) as ours.
@@ -54,6 +86,53 @@ def _get_digest(algo: str) -> Any:  # noqa: ANN401
         return hashlib.blake2b(digest_size=32)
 
     return hashlib.new(algo)
+
+
+def _normalize_hash_algorithm(algo: object) -> str | None:
+    """Return the canonical name for an allowed hash algorithm.
+
+    ``hashlib`` accepts several spellings for the same algorithm (for example
+    "SHA256", "sha-256" and "sha256"). Metadata is expected to use the
+    canonical spelling, but the names are normalized here so that an allowed
+    algorithm is not rejected just because of letter case or separators.
+
+    Returns ``None`` if ``algo`` is not a string or does not name an allowed
+    algorithm. Weak algorithms (md5, sha1, ...) and algorithms unknown to the
+    platform are never returned.
+    """
+    if not isinstance(algo, str):
+        return None
+
+    if algo == _BLAKE_HASH_ALGORITHM:
+        return algo
+
+    try:
+        # hashlib raises ValueError for unknown algorithms and TypeError for
+        # malformed names. Both must result in rejection, not an exception.
+        canonical = hashlib.new(algo).name
+    except (ValueError, TypeError):
+        return None
+
+    if canonical not in _ALLOWED_HASH_ALGORITHMS:
+        return None
+
+    return canonical
+
+
+def _get_canonical_hash_algorithm(algo: object) -> str:
+    """Return the canonical hash name for an allowed algorithm.
+
+    Raises:
+        UnsupportedHashAlgorithmError: ``algo`` is not an allowed algorithm.
+    """
+    canonical = _normalize_hash_algorithm(algo)
+    if canonical is None:
+        raise UnsupportedHashAlgorithmError(
+            f"Unsupported hash algorithm '{algo}': expected one of "
+            f"{sorted(_ALLOWED_HASH_ALGORITHMS)}"
+        )
+
+    return canonical
 
 
 def _hash_bytes(data: bytes, algo: str) -> str:
@@ -707,26 +786,58 @@ class BaseFile:
     Encapsulates common static methods for length and hash verification.
     """
 
+    # Subclasses either always define hashes (TargetFile) or may not have
+    # them at all (MetaFile).
+    hashes: dict[str, str] | None
+
+    def validate_hash_algorithms(self) -> None:
+        """Reject ``self.hashes`` if it uses a disallowed hash algorithm.
+
+        Weak algorithms (for example md5 and sha1) and algorithms unknown to
+        the platform are not accepted, and a hash dictionary is rejected as a
+        whole if even one of its algorithms is disallowed. Callers can use this
+        before any content is fetched or verified to reject unusable metadata
+        early and explicitly.
+
+        Raises:
+            UnsupportedHashAlgorithmError: ``self.hashes`` contains an
+                algorithm that is not supported or not allowed.
+        """
+        if self.hashes is not None:
+            for algo in self.hashes:
+                _get_canonical_hash_algorithm(algo)
+
     @staticmethod
     def _verify_hashes(
         data: bytes | IO[bytes], expected_hashes: dict[str, str]
     ) -> None:
-        """Verify that the hash of ``data`` matches ``expected_hashes``."""
+        """Verify that the hash of ``data`` matches ``expected_hashes``.
+
+        Every algorithm in ``expected_hashes`` is checked against the allowed
+        algorithms before any content is hashed: a single weak or unknown
+        algorithm rejects the whole hash dictionary. This happens both for
+        metadata files (``MetaFile``) and target files (``TargetFile``) so
+        neither verification path can bypass the policy.
+        """
+        # Validate every algorithm before hashing any content: a weak or
+        # unknown algorithm is rejected even if the content would also fail
+        # to match.
+        canonical_algorithms = {
+            algo: _get_canonical_hash_algorithm(algo)
+            for algo in expected_hashes
+        }
+
         for algo, exp_hash in expected_hashes.items():
-            try:
-                if isinstance(data, bytes):
-                    observed_hash = _hash_bytes(data, algo)
-                else:
-                    # if data is not bytes, assume it is a file object
-                    observed_hash = _hash_file(data, algo)
-            except (ValueError, TypeError) as e:
-                raise LengthOrHashMismatchError(
-                    f"Unsupported algorithm '{algo}'"
-                ) from e
+            canonical = canonical_algorithms[algo]
+            if isinstance(data, bytes):
+                observed_hash = _hash_bytes(data, canonical)
+            else:
+                # if data is not bytes, assume it is a file object
+                observed_hash = _hash_file(data, canonical)
 
             if observed_hash != exp_hash:
                 raise LengthOrHashMismatchError(
-                    f"Observed hash {observed_hash} does not match "
+                    f"Observed {algo} hash {observed_hash} does not match "
                     f"expected hash {exp_hash}"
                 )
 
@@ -775,14 +886,19 @@ class BaseFile:
         if hash_algorithms is None:
             hash_algorithms = [_DEFAULT_HASH_ALGORITHM]
 
-        for algorithm in hash_algorithms:
-            try:
-                if isinstance(data, bytes):
-                    hashes[algorithm] = _hash_bytes(data, algorithm)
-                else:
-                    hashes[algorithm] = _hash_file(data, algorithm)
-            except (ValueError, TypeError) as e:
-                raise ValueError(f"Unsupported algorithm '{algorithm}'") from e
+        # Validate every requested algorithm before hashing any content: a
+        # weak or unknown algorithm rejects the whole request.
+        canonical_algorithms = [
+            _get_canonical_hash_algorithm(algo) for algo in hash_algorithms
+        ]
+
+        for algorithm, canonical in zip(
+            hash_algorithms, canonical_algorithms, strict=True
+        ):
+            if isinstance(data, bytes):
+                hashes[algorithm] = _hash_bytes(data, canonical)
+            else:
+                hashes[algorithm] = _hash_file(data, canonical)
 
         return (length, hashes)
 
@@ -874,8 +990,8 @@ class MetaFile(BaseFile):
             specified, "sha256" is used.
 
         Raises:
-            ValueError: The hash algorithms list contains an unsupported
-            algorithm.
+            UnsupportedHashAlgorithmError: The hash algorithms list contains
+                an unsupported or disallowed algorithm.
         """
         length, hashes = cls._get_length_and_hashes(data, hash_algorithms)
         return cls(version, length, hashes)
@@ -902,9 +1018,16 @@ class MetaFile(BaseFile):
             data: File object or its content in bytes.
 
         Raises:
+            UnsupportedHashAlgorithmError: ``hashes`` contains an algorithm
+                that is not supported or not allowed. This is raised before
+                any content is hashed.
             LengthOrHashMismatchError: Calculated length or hashes do not
-                match expected values or hash algorithm is not supported.
+                match expected values.
         """
+        # Reject unusable metadata before looking at the content: the error
+        # must not depend on whether the content happens to match.
+        self.validate_hash_algorithms()
+
         if self.length is not None:
             self._verify_length(data, self.length)
 
@@ -1554,6 +1677,9 @@ class TargetFile(BaseFile):
         ValueError, TypeError: Invalid arguments.
     """
 
+    # Target files always have hashes, unlike metadata files
+    hashes: dict[str, str]
+
     def __init__(
         self,
         length: int,
@@ -1635,8 +1761,8 @@ class TargetFile(BaseFile):
 
         Raises:
             FileNotFoundError: The file doesn't exist.
-            ValueError: The hash algorithms list contains an unsupported
-                algorithm.
+            UnsupportedHashAlgorithmError: The hash algorithms list contains
+                an unsupported or disallowed algorithm.
         """
         with open(local_path, "rb") as file:
             return cls.from_data(target_file_path, file, hash_algorithms)
@@ -1658,8 +1784,8 @@ class TargetFile(BaseFile):
                 specified, "sha256" is used.
 
         Raises:
-            ValueError: The hash algorithms list contains an unsupported
-                algorithm.
+            UnsupportedHashAlgorithmError: The hash algorithms list contains
+                an unsupported or disallowed algorithm.
         """
         length, hashes = cls._get_length_and_hashes(data, hash_algorithms)
         return cls(length, hashes, target_file_path)
@@ -1671,9 +1797,16 @@ class TargetFile(BaseFile):
             data: Target file object or its content in bytes.
 
         Raises:
+            UnsupportedHashAlgorithmError: ``hashes`` contains an algorithm
+                that is not supported or not allowed. This is raised before
+                any content is hashed.
             LengthOrHashMismatchError: Calculated length or hashes do not
-                match expected values or hash algorithm is not supported.
+                match expected values.
         """
+        # Reject unusable metadata before looking at the content: the error
+        # must not depend on whether the content happens to match.
+        self.validate_hash_algorithms()
+
         self._verify_length(data, self.length)
         self._verify_hashes(data, self.hashes)
 

@@ -43,6 +43,19 @@ class LengthOrHashMismatchError(RepositoryError):
     """An error while checking the length and hash values of an object."""
 
 
+class UnsupportedHashAlgorithmError(LengthOrHashMismatchError, ValueError):
+    """Metadata requires a hash algorithm that is not supported or not
+    allowed (for example a cryptographically weak md5 or sha1).
+
+    This is a subclass of both ``LengthOrHashMismatchError`` and
+    ``ValueError`` so that existing code catching either type keeps working.
+    The separate type allows callers to distinguish "the content does not
+    match the metadata" (a cache miss or a failed download) from "the metadata
+    itself cannot be used" (the algorithm must be rejected regardless of
+    content).
+    """
+
+
 #### Download Errors ####
 
 

@@ -7,6 +7,7 @@ target files storing/loading from cache.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import sys
 import tempfile
@@ -14,9 +15,9 @@ import unittest
 from dataclasses import dataclass
 
 from tests import utils
-from tests.repository_simulator import RepositorySimulator
-from tuf.api.exceptions import RepositoryError
-from tuf.api.metadata import DelegatedRole, Delegations
+from tests.repository_simulator import RepositorySimulator, RepositoryTarget
+from tuf.api.exceptions import RepositoryError, UnsupportedHashAlgorithmError
+from tuf.api.metadata import DelegatedRole, Delegations, TargetFile
 from tuf.ngclient import Updater
 
 
@@ -207,9 +208,135 @@ class TestFetchTarget(unittest.TestCase):
         with open(path, "rb") as f:
             self.assertEqual(f.read(), target.content)
 
+    def test_weak_hash_algorithm_target_rejected(self) -> None:
+        """Targets with a weak hash algorithm are rejected explicitly.
+
+        The repository advertises an md5 hash (with a correct digest, so no
+        content mismatch can be blamed): the client must reject the metadata
+        before downloading and must not leave a usable cached file behind.
+        """
+        target = TestTarget("targetpath", b"content", "targetpath")
+
+        # Publish a target whose only hash is a correct md5 digest
+        target_info = TargetFile(
+            len(target.content),
+            {"md5": hashlib.md5(target.content).hexdigest()},
+            target.path,
+        )
+        self.sim.targets.targets[target.path] = target_info
+        self.sim.target_files[target.path] = RepositoryTarget(
+            target.content, target_info
+        )
+        self.sim.update_snapshot()
+
+        updater = self._init_updater()
+        info = updater.get_targetinfo(target.path)
+        assert info is not None
+
+        expected_path = os.path.join(self.targets_dir, target.encoded_path)
+
+        # Both cache lookup and download reject the algorithm, before any
+        # content is fetched and regardless of whether a file exists
+        with self.assertRaises(UnsupportedHashAlgorithmError):
+            updater.find_cached_target(info)
+        with self.assertRaises(UnsupportedHashAlgorithmError):
+            updater.download_target(info)
+
+        # Nothing was downloaded or cached
+        self.assertFalse(os.path.exists(expected_path))
+        self.assertEqual(self.sim.fetch_tracker.targets, [])
+
+        # A file that happens to be present is not reported as a cached match
+        with open(expected_path, "wb") as f:
+            f.write(target.content)
+        with self.assertRaises(UnsupportedHashAlgorithmError):
+            updater.find_cached_target(info)
+
+    def test_mixed_weak_hash_algorithm_target_rejected(self) -> None:
+        """A hash set containing any weak algorithm is rejected as a whole."""
+        target = TestTarget("targetpath", b"content", "targetpath")
+
+        # Correct sha256 *and* correct md5: the sha256 alone would match, but
+        # the presence of md5 must still reject the metadata
+        self.sim.targets.targets[target.path] = TargetFile(
+            len(target.content),
+            {
+                "sha256": hashlib.sha256(target.content).hexdigest(),
+                "md5": hashlib.md5(target.content).hexdigest(),
+            },
+            target.path,
+        )
+        self.sim.update_snapshot()
+
+        updater = self._init_updater()
+        info = updater.get_targetinfo(target.path)
+        assert info is not None
+
+        with self.assertRaises(UnsupportedHashAlgorithmError):
+            updater.download_target(info)
+        with self.assertRaises(UnsupportedHashAlgorithmError):
+            updater.find_cached_target(info)
+
+    def test_allowed_hash_algorithms_target_accepted(self) -> None:
+        """Allowed and mixed strong hash sets keep working end to end."""
+        target = TestTarget("targetpath", b"content", "targetpath")
+
+        for algorithms in (["sha256"], ["sha512"], ["sha256", "sha512"]):
+            target_info = TargetFile.from_data(
+                target.path, target.content, algorithms
+            )
+            self.sim.targets.version += 1
+            self.sim.targets.targets[target.path] = target_info
+            self.sim.target_files[target.path] = RepositoryTarget(
+                target.content, target_info
+            )
+            self.sim.update_snapshot()
+
+            updater = self._init_updater()
+            info = updater.get_targetinfo(target.path)
+            assert info is not None
+            path = updater.download_target(info)
+            self.assertEqual(path, updater.find_cached_target(info))
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), target.content)
+
+    def test_failed_verification_not_cached(self) -> None:
+        """A failed verification leaves no reusable cache entry.
+
+        Content that does not match the metadata is not cached; repeated
+        attempts must keep failing and keep reporting no cached target, so a
+        failed state can never be reused as a valid cache hit.
+        """
+        target = TestTarget("targetpath", b"content", "targetpath")
+
+        self.sim.targets.version += 1
+        self.sim.add_target("targets", target.content, target.path)
+        self.sim.update_snapshot()
+
+        updater = self._init_updater()
+        info = updater.get_targetinfo(target.path)
+        assert info is not None
+
+        # Serve content that does not match the hash
+        self.sim.target_files[target.path].data = b"conten@"
+        for _ in range(2):
+            with self.assertRaises(RepositoryError):
+                updater.download_target(info)
+            self.assertIsNone(updater.find_cached_target(info))
+            self.assertEqual(
+                updater.find_cached_target(
+                    info, os.path.join(self.targets_dir, "other")
+                ),
+                None,
+            )
+
+        # Once the content matches again, download succeeds and is cached
+        self.sim.target_files[target.path].data = target.content
+        path = updater.download_target(info)
+        self.assertEqual(path, updater.find_cached_target(info))
+
     def test_meta_missing_delegated_role(self) -> None:
         """Test a delegation where the role is not part of the snapshot"""
-
         # Add new delegation, update snapshot. Do not add the actual role
         role = DelegatedRole("role1", [], 1, True, ["*"])
         self.sim.targets.delegations = Delegations({}, roles={role.name: role})

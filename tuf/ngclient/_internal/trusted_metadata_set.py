@@ -328,8 +328,12 @@ class TrustedMetadataSet(abc.Mapping):
         snapshot_meta = self.timestamp.snapshot_meta
 
         # Verify non-trusted data against the hashes in timestamp, if any.
-        # Trusted snapshot data has already been verified once.
-        if not trusted:
+        # Trusted snapshot data has already been verified once: its content is
+        # not checked again, but the hash algorithm policy still applies so
+        # that a weak algorithm is never silently accepted.
+        if trusted:
+            snapshot_meta.validate_hash_algorithms()
+        else:
             snapshot_meta.verify_length_and_hashes(data)
 
         new_snapshot, _, _ = self._load_data(Snapshot, data, self.root)

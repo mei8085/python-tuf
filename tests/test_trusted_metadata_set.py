@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import sys
@@ -473,6 +474,72 @@ class TestTrustedMetadataSet(unittest.TestCase):
         )
         # remove meta information with information about targets from snapshot
         with self.assertRaises(exceptions.RepositoryError):
+            self.trusted_set.update_targets(self.metadata[Targets.type])
+
+    def test_update_snapshot_unsupported_hash_algorithm(self) -> None:
+        """A weak metadata hash algorithm is rejected explicitly.
+
+        Timestamp advertises an md5 hash for snapshot (with the correct digest
+        so the content itself matches). The metadata path must reject the
+        algorithm just like the target path does.
+        """
+
+        def weak_hash_modifier(timestamp: Timestamp) -> None:
+            hashes = {
+                "md5": hashlib.md5(self.metadata[Snapshot.type]).hexdigest()
+            }
+            timestamp.snapshot_meta.hashes = hashes
+
+        timestamp = self.modify_metadata(Timestamp.type, weak_hash_modifier)
+        self.trusted_set.update_timestamp(timestamp)
+
+        with self.assertRaises(exceptions.UnsupportedHashAlgorithmError):
+            self.trusted_set.update_snapshot(self.metadata[Snapshot.type])
+
+    def test_update_snapshot_unsupported_hash_algorithm_trusted(self) -> None:
+        """A weak algorithm is rejected for trusted snapshot data as well.
+
+        ``trusted=True`` skips content verification (the data was verified
+        once already) but must not skip the algorithm policy.
+        """
+
+        def weak_hash_modifier(timestamp: Timestamp) -> None:
+            hashes = {
+                "md5": hashlib.md5(self.metadata[Snapshot.type]).hexdigest()
+            }
+            timestamp.snapshot_meta.hashes = hashes
+
+        timestamp = self.modify_metadata(Timestamp.type, weak_hash_modifier)
+        self.trusted_set.update_timestamp(timestamp)
+
+        with self.assertRaises(exceptions.UnsupportedHashAlgorithmError):
+            self.trusted_set.update_snapshot(
+                self.metadata[Snapshot.type], trusted=True
+            )
+
+    def test_update_targets_unsupported_hash_algorithm(self) -> None:
+        """A weak metadata hash algorithm is rejected explicitly in snapshot."""
+
+        def weak_hash_modifier(snapshot: Snapshot) -> None:
+            snapshot.meta[f"{Targets.type}.json"] = MetaFile(
+                version=snapshot.meta[f"{Targets.type}.json"].version,
+                length=len(self.metadata[Targets.type]),
+                hashes={
+                    "sha256": hashlib.sha256(
+                        self.metadata[Targets.type]
+                    ).hexdigest(),
+                    "sha1": hashlib.sha1(
+                        self.metadata[Targets.type]
+                    ).hexdigest(),
+                },
+            )
+
+        snapshot = self.modify_metadata(Snapshot.type, weak_hash_modifier)
+        self._update_all_besides_targets(
+            self.metadata[Timestamp.type], snapshot
+        )
+
+        with self.assertRaises(exceptions.UnsupportedHashAlgorithmError):
             self.trusted_set.update_targets(self.metadata[Targets.type])
 
     def test_update_targets_hash_diverge_from_snapshot_meta_hash(self) -> None:

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -921,14 +922,14 @@ class TestMetadata(unittest.TestCase):
             snapshot_metafile.hashes = {
                 "unsupported-alg": "8f88e2ba48b412c3843e9bb26e1b6f8fc9e98aceb0fbaa97ba37b4c98717d7ab"
             }
-            with self.assertRaises(exceptions.LengthOrHashMismatchError):
+            with self.assertRaises(exceptions.UnsupportedHashAlgorithmError):
                 snapshot_metafile.verify_length_and_hashes(data)
 
             # Test wrong algorithm format (sslib.FormatError)
             snapshot_metafile.hashes = {
                 256: "8f88e2ba48b412c3843e9bb26e1b6f8fc9e98aceb0fbaa97ba37b4c98717d7ab"  # type: ignore[dict-item]
             }
-            with self.assertRaises(exceptions.LengthOrHashMismatchError):
+            with self.assertRaises(exceptions.UnsupportedHashAlgorithmError):
                 snapshot_metafile.verify_length_and_hashes(data)
 
             # test optional length and hashes
@@ -955,6 +956,82 @@ class TestMetadata(unittest.TestCase):
             file1_targetfile.hashes = {"sha256": "incorrecthash"}
             with self.assertRaises(exceptions.LengthOrHashMismatchError):
                 file1_targetfile.verify_length_and_hashes(file1)
+
+    def test_hash_algorithm_admission(self) -> None:
+        """Weak/unknown algorithms are rejected, allowed ones keep working.
+
+        The same expectation must hold for metadata files (``MetaFile``) and
+        target files (``TargetFile``): neither path may accept a weak
+        algorithm, and the rejection must happen before content is verified.
+        """
+        data = b"Inline test content"
+
+        # Allowed algorithms (including a mixed set) keep verifying
+        for algorithms in (
+            ["sha256"],
+            ["sha512"],
+            ["sha384"],
+            ["sha3-256"],
+            ["blake2b-256"],
+            ["sha256", "sha512"],
+        ):
+            target = TargetFile.from_data("file.txt", data, algorithms)
+            target.verify_length_and_hashes(data)
+            metafile = MetaFile.from_data(1, data, algorithms)
+            metafile.verify_length_and_hashes(data)
+
+        # Names are normalized: aliases of an allowed algorithm are accepted
+        for algorithms in (["SHA256"], ["sha-256"]):
+            target = TargetFile.from_data("file.txt", data, algorithms)
+            target.verify_length_and_hashes(data)
+            metafile = MetaFile.from_data(1, data, algorithms)
+            metafile.verify_length_and_hashes(data)
+
+        # Weak and unknown algorithms are rejected when creating metadata
+        for algorithm in ("md5", "sha1", "unsupported-alg"):
+            with self.assertRaises(exceptions.UnsupportedHashAlgorithmError):
+                TargetFile.from_data("file.txt", data, [algorithm])
+            with self.assertRaises(exceptions.UnsupportedHashAlgorithmError):
+                MetaFile.from_data(1, data, [algorithm])
+
+        # Verification rejects weak algorithms even though the digest would
+        # match: the policy is not about content, it is about the algorithm.
+        accurate_md5 = {"md5": hashlib.md5(data).hexdigest()}
+        entries = (
+            TargetFile(len(data), dict(accurate_md5), "file.txt"),
+            MetaFile(1, len(data), dict(accurate_md5)),
+        )
+        for entry in entries:
+            with self.assertRaises(exceptions.UnsupportedHashAlgorithmError):
+                entry.verify_length_and_hashes(data)
+
+        # A mixed hash set containing a weak algorithm is rejected as a whole,
+        # so the weak hash cannot be silently skipped
+        weak_and_strong = {
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "md5": hashlib.md5(data).hexdigest(),
+        }
+        target = TargetFile(len(data), dict(weak_and_strong), "file.txt")
+        with self.assertRaises(exceptions.UnsupportedHashAlgorithmError):
+            target.verify_length_and_hashes(data)
+        metafile = MetaFile(1, len(data), dict(weak_and_strong))
+        with self.assertRaises(exceptions.UnsupportedHashAlgorithmError):
+            metafile.verify_length_and_hashes(data)
+
+        # validate_hash_algorithms() rejects without needing content at all
+        for entry in (target, metafile):
+            with self.assertRaises(exceptions.UnsupportedHashAlgorithmError):
+                entry.validate_hash_algorithms()
+
+        # The error is catchable both as the old generic error and as
+        # ValueError (the error type used for invalid arguments previously)
+        self.assertIsInstance(
+            exceptions.UnsupportedHashAlgorithmError(), ValueError
+        )
+        self.assertIsInstance(
+            exceptions.UnsupportedHashAlgorithmError(),
+            exceptions.LengthOrHashMismatchError,
+        )
 
     def test_targetfile_from_file(self) -> None:
         # Test with an existing file and valid hash algorithm

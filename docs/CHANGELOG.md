@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Added
+
+* Metadata API and ngclient now enforce an allowlist of hash algorithms for
+  metadata files and target files: weak algorithms (md5, sha1, ...) and
+  unknown algorithms are rejected with the new
+  `UnsupportedHashAlgorithmError` *before* any content is hashed or
+  downloaded. A hash set is rejected as a whole if any of its algorithms is
+  not allowed, so a weak hash can never serve as a fallback. Allowed
+  algorithms (sha224/256/384/512, sha512_224/256, sha3, blake2s/blake2b and
+  the legacy "blake2b-256") keep working, including mixed sets and the
+  pre-existing behaviour for metadata files without hashes.
+
 ### Changed
 
 * Add Python 3.15 to tested versions, remove 3.10 from tested versions.
