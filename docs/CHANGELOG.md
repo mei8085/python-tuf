@@ -7,6 +7,12 @@
 * Add Python 3.15 to tested versions, remove 3.10 from tested versions.
   Require at least 3.11
 
+### Added
+
+* tests: Differential numeric-parsing tests for the two envelope entry points
+  (traditional metadata and DSSE/Simple envelopes), including duplicate keys
+  and alternative numeric encodings, with minimized reproducers.
+
 ## v7.0.1
 
 ### Fixed
